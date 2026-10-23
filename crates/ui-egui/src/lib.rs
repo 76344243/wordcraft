@@ -23,6 +23,7 @@ macro_rules! tl {
 pub mod a11y;
 pub mod a11y_pane;
 pub mod async_saves;
+// Fork patch: any number of windows (see multi_window.rs).
 pub mod autoscroll;
 pub mod backstage;
 pub mod canvas;
@@ -64,6 +65,7 @@ pub mod ink;
 pub mod keys;
 pub mod keytips;
 pub mod mini_toolbar;
+pub mod multi_window;
 pub mod objects;
 pub mod options;
 pub mod panes;
@@ -173,6 +175,9 @@ pub struct Services {
     /// `xdg-mime`. `None` (web, macOS) hides the button; macOS shows how to do it in Finder
     /// instead. An error means nothing changed.
     pub make_default_app: Option<Box<dyn Fn() -> Result<DefaultApp, String>>>,
+    /// Fork patch (multi_window.rs): desktop: start a new WordCraft window (a new process) with
+    /// this file, or with a new blank document for `None`. An error means no window started.
+    pub new_window: Option<Box<dyn Fn(Option<&str>) -> Result<(), String>>>,
     /// Desktop: the app's own user templates folder (`Templates` in the settings folder, #2852),
     /// used while File › Options names none. File › New lists personal templates from it and Save
     /// as Word Template starts in it. `None` (web) hides personal templates.
@@ -907,6 +912,10 @@ impl WordApp {
             self.dialog = dialogs::Dialog::open(name, self);
             return Ok(json!({"pending": name}));
         }
+        // Fork patch: New and Open go to a new window when this one is in use (multi_window.rs).
+        if let Some(r) = multi_window::redirect(self, id, &params) {
+            return r;
+        }
         if (self.session.dirty || self.save_unconfirmed() || refused.is_some()) && discards_document(id, &params) {
             let name = self.prompt_name();
             self.dialog = Some(dialogs::Dialog::SaveChanges {
@@ -1482,6 +1491,10 @@ impl WordApp {
         if let Some(what) = req.get("open").and_then(Value::as_str) {
             match what {
                 "openFile" => self.open_dialog(),
+                // Fork patch: View › New Window (multi_window.rs).
+                "newWindow" if self.services.new_window.is_some() => {
+                    let _ = multi_window::open(self, None);
+                }
                 "saveAs" => {
                     self.save_as_dialog();
                 }
