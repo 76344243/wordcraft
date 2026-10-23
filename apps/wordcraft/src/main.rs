@@ -9,6 +9,7 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+// Fork patch: any number of windows.
 mod animations;
 #[cfg(target_os = "macos")]
 mod apple_events;
@@ -19,6 +20,7 @@ mod file_dialogs;
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
 mod graphics;
 mod logging;
+mod new_window;
 mod print;
 mod region;
 #[cfg(target_os = "macos")]
@@ -254,6 +256,8 @@ fn services(file_dialog: file_dialogs::Hook, ctx: &egui::Context) -> Services {
         set_clipboard_html: Some(Box::new(clipboard::set_html)),
         clipboard_rtf: Some(Box::new(clipboard::rtf)),
         clipboard_formats: Some(Box::new(clipboard::formats)),
+        // Fork patch: any number of windows.
+        new_window: Some(Box::new(new_window::launch)),
         ..Default::default()
     }
 }
@@ -327,6 +331,7 @@ fn main() -> eframe::Result {
     let mut control_port: Option<u16> = std::env::var("WORDCRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok());
     let mut files = Vec::new();
     let mut sample = false;
+    let mut cascade = false;
     let (args, other_files) = text_args();
     let mut bad_control: Option<Option<String>> = None;
     let mut args = args.into_iter().peekable();
@@ -341,6 +346,8 @@ fn main() -> eframe::Result {
                 }
             }
             "--sample" => sample = true,
+            // Fork patch: started by another window (new_window.rs).
+            new_window::FLAG => cascade = true,
             "--version" => {
                 println!("wordcraft {} ({})", env!("CARGO_PKG_VERSION"), build_sha());
                 return Ok(());
@@ -397,7 +404,15 @@ fn main() -> eframe::Result {
     #[cfg(target_os = "macos")]
     graphics::configure_indirect_validation(&mut options, graphics::skips_indirect_validation(true, cfg!(target_arch = "x86_64")));
     load_user_fonts();
-    let restored = saved_window();
+    let mut restored = saved_window();
+    // Fork patch: a window started from another one opens offset from it.
+    if cascade
+        && let Some(w) = restored.as_mut()
+        && let Some([x, y]) = w.position
+    {
+        let n = std::process::id() % 6 + 1;
+        w.position = Some([x + 28.0 * n as f32, y + 28.0 * n as f32]);
+    }
     if let Some(window) = restored {
         options.viewport = window.apply(options.viewport);
     }
