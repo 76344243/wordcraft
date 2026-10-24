@@ -11,6 +11,9 @@
 //! the standard: new documents, new windows and files without their own entry open that way.
 //! Files that already have their own entry keep it.
 //!
+//! A file only gets its own entry when its window or zoom was changed while it was shown (moved,
+//! resized, zoomed): a file merely opened and closed again keeps following the Open-Standard.
+//!
 //! What is remembered is written when the document leaves the window (another file opened in
 //! it, the window closed or WordCraft quit). Each window is its own process; they share the file
 //! by reading it fresh before every write, so one window never drops what another remembered.
@@ -45,6 +48,10 @@ pub struct Entry {
     /// When it was remembered (seconds since 1970), to drop the oldest first.
     #[serde(default)]
     pub at: u64,
+    /// Remembered because the user changed the window or zoom. Entries from the first version,
+    /// which remembered every file opened, lack it and are ignored.
+    #[serde(default)]
+    pub changed: bool,
 }
 
 impl Entry {
@@ -113,14 +120,14 @@ fn standard_in(path: &Path) -> Option<Entry> {
 pub fn set_standard(window: Option<WindowGeometry>, zoom: f32, fit: &str) -> Result<(), String> {
     let store = file().ok_or("preferences are off")?;
     let window = window.and_then(WindowGeometry::sanitized).ok_or("the window's size isn't known yet")?;
-    store_key(&store, STANDARD.into(), Entry { window, zoom, fit: fit.into(), at: 0 })
+    store_key(&store, STANDARD.into(), Entry { window, zoom, fit: fit.into(), at: 0, changed: false })
 }
 
 /// Where a new window opens: where `doc` was last, else at the Open-Standard. `None`: neither is
 /// known, the window opens as before (the last window used).
 pub fn launch_geometry(doc: Option<&str>) -> Option<WindowGeometry> {
     let mut memory = load_from(&file()?);
-    let own = doc.and_then(|d| memory.remove(&key(Path::new(d))));
+    let own = doc.and_then(|d| memory.remove(&key(Path::new(d)))).filter(|e| e.changed);
     own.or_else(|| memory.remove(STANDARD)).and_then(|e| e.window.sanitized())
 }
 
@@ -142,6 +149,38 @@ struct Tracker {
     last: Option<Snapshot>,
     /// A window moved to a remembered place, and when: its monitor is checked a little later.
     rescue: Option<(WindowGeometry, Instant)>,
+    /// How the document was shown once its window had settled after it arrived; it is
+    /// remembered only if it differs from this when it leaves.
+    baseline: Option<Entry>,
+    /// When to take the baseline.
+    baseline_at: Option<Instant>,
+}
+
+/// Whether the user changed the window or zoom: more than a couple of points of movement or
+/// size (the system may round), another zoom or fit mode.
+fn changed(now: &Entry, base: &Entry) -> bool {
+    let (a, b) = (&now.window, &base.window);
+    let far = |x: f32, y: f32| (x - y).abs() > 2.0;
+    let moved = match (a.position, b.position) {
+        (Some([x1, y1]), Some([x2, y2])) => far(x1, x2) || far(y1, y2),
+        (p, q) => p.is_some() != q.is_some(),
+    };
+    moved
+        || far(a.width, b.width)
+        || far(a.height, b.height)
+        || a.maximized != b.maximized
+        || (now.zoom - base.zoom).abs() > 0.005
+        || now.fit != base.fit
+}
+
+/// Writes the snapshot of the document leaving, if the user changed how it was shown.
+fn leave(store: &Path, t: &mut Tracker) {
+    let (Some(last), Some(base)) = (t.last.take(), t.baseline.take()) else { return };
+    if changed(&last.entry, &base)
+        && let Err(e) = store_to(store, &last.doc, Entry { changed: true, ..last.entry })
+    {
+        log::warn!("window memory: not saved: {e}");
+    }
 }
 
 thread_local! {
@@ -155,7 +194,7 @@ fn shown_file(app: &WordApp) -> Option<PathBuf> {
 fn snapshot(app: &WordApp) -> Option<Snapshot> {
     let doc = shown_file(app)?;
     let window = app.ui.window?;
-    Some(Snapshot { doc, entry: Entry { window, zoom: app.session.view.zoom, fit: app.session.view.fit.clone(), at: 0 } })
+    Some(Snapshot { doc, entry: Entry { window, zoom: app.session.view.zoom, fit: app.session.view.fit.clone(), at: 0, changed: false } })
 }
 
 /// Every frame, after the window's geometry was tracked: notices a file arriving in or leaving
@@ -167,25 +206,20 @@ pub fn frame(app: &mut WordApp, ctx: &egui::Context) {
     TRACKER.with(|t| {
         let mut t = t.borrow_mut();
         let arrived = t.document != Some(document);
-        if shown != t.shown || arrived {
-            // The document leaving (or saved under another name) is remembered under its file.
-            if let Some(last) = t.last.take()
-                && let Err(e) = store_to(&store, &last.doc, last.entry)
-            {
-                log::warn!("window memory: not saved: {e}");
-            }
+        if arrived {
+            // The document leaving is remembered under its file, if the user changed its window.
+            leave(&store, &mut t);
         }
+        // Saved under another name: the same document, and the snapshot below takes the new file.
         if arrived {
             // Its own place if the file has one; otherwise the Open-Standard, if set.
             let memory = load_from(&store);
-            let own = shown.as_ref().and_then(|doc| memory.get(&key(doc)).cloned());
-            let first_frame = t.document.is_none();
-            let entry = own.clone().or_else(|| memory.get(STANDARD).cloned());
+            let own = shown.as_ref().and_then(|doc| memory.get(&key(doc)).cloned()).filter(|e| e.changed);
+            let entry = own.or_else(|| memory.get(STANDARD).cloned());
             if let Some(entry) = entry {
-                // The launch window already opened at the right place (`launch_geometry`).
-                if !first_frame || own.is_none() {
-                    place(ctx, &mut t, &entry);
-                }
+                // Also on the first frame, where the window already opened there
+                // (`launch_geometry`): this way its monitor is checked as well.
+                place(ctx, &mut t, &entry);
                 if let Some(param) = entry.zoom_param()
                     && let Err(e) = app.execute("view.zoom", param)
                 {
@@ -193,6 +227,8 @@ pub fn frame(app: &mut WordApp, ctx: &egui::Context) {
                 }
             }
             t.document = Some(document);
+            t.baseline = None;
+            t.baseline_at = Some(Instant::now() + RESCUE_DELAY * 2);
         }
         t.shown = shown;
         // A remembered monitor that isn't there any more: centre the window on the main one.
@@ -207,6 +243,14 @@ pub fn frame(app: &mut WordApp, ctx: &egui::Context) {
             ctx.request_repaint_after(RESCUE_DELAY);
         }
         t.last = snapshot(app);
+        if let Some(at) = t.baseline_at {
+            if Instant::now() >= at {
+                t.baseline_at = None;
+                t.baseline = t.last.as_ref().map(|s| s.entry.clone());
+            } else {
+                ctx.request_repaint_after(at.saturating_duration_since(Instant::now()));
+            }
+        }
     });
 }
 
@@ -224,14 +268,15 @@ fn place(ctx: &egui::Context, t: &mut Tracker, entry: &Entry) {
     t.rescue = Some((g, Instant::now()));
 }
 
-/// When the window closes or WordCraft quits: remember the file shown now.
+/// When the window closes or WordCraft quits: remember the file shown now, if its window or zoom
+/// was changed.
 pub fn remember_now(app: &WordApp) {
     let Some(store) = file() else { return };
-    if let Some(s) = snapshot(app)
-        && let Err(e) = store_to(&store, &s.doc, s.entry)
-    {
-        log::warn!("window memory: not saved: {e}");
-    }
+    TRACKER.with(|t| {
+        let mut t = t.borrow_mut();
+        t.last = snapshot(app);
+        leave(&store, &mut t);
+    });
 }
 
 #[cfg(test)]
@@ -243,7 +288,7 @@ mod tests {
     }
 
     fn entry(x: f32, zoom: f32, fit: &str) -> Entry {
-        Entry { window: geometry(x), zoom, fit: fit.into(), at: 0 }
+        Entry { window: geometry(x), zoom, fit: fit.into(), at: 0, changed: true }
     }
 
     #[test]
@@ -277,6 +322,18 @@ mod tests {
         assert_eq!(m.len(), MAX_ENTRIES);
         assert_eq!(standard_in(&store).map(|e| e.zoom), Some(1.1));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_window_or_zoom_the_user_changed_counts() {
+        let base = entry(100.0, 1.2, "");
+        assert!(!changed(&entry(101.5, 1.2, ""), &base), "a point of rounding");
+        assert!(changed(&entry(160.0, 1.2, ""), &base), "moved");
+        assert!(changed(&entry(100.0, 1.5, ""), &base), "zoomed");
+        assert!(changed(&entry(100.0, 1.2, "pageWidth"), &base), "fit mode");
+        let mut bigger = base.clone();
+        bigger.window.height += 40.0;
+        assert!(changed(&bigger, &base), "resized");
     }
 
     #[test]
