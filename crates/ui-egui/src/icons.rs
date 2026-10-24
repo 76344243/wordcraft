@@ -1059,6 +1059,12 @@ pub fn paint(p: &Painter, r: Rect, name: &str, c: Color32, accent: Color32) {
             pen.rect(2.5, 5.0, 13.0, 15.0, c);
             pen.rect(7.0, 2.5, 17.5, 12.5, a);
         }
+        // Fork patch: a window with a check mark (this window, this zoom, from now on).
+        "openDefault" => {
+            pen.rect(2.5, 3.5, 17.5, 16.5, c);
+            pen.line_c(&[(2.5, 6.5), (17.5, 6.5)], c);
+            pen.line_c(&[(6.5, 11.5), (9.0, 14.0), (13.5, 9.0)], a);
+        }
         "arrangeAll" => {
             pen.rect(3.0, 2.5, 17.0, 9.0, c);
             pen.rect(3.0, 11.0, 17.0, 17.5, a);

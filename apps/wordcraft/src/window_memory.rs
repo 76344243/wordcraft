@@ -7,6 +7,10 @@
 //! monitor (the check `WindowGeometry::rescue_position` makes for the launch window). A file
 //! opened for the first time keeps the window it got: the last one used, as before.
 //!
+//! View › Set Open-Standard makes the window as it is now (monitor, position, size) and its zoom
+//! the standard: new documents, new windows and files without their own entry open that way.
+//! Files that already have their own entry keep it.
+//!
 //! What is remembered is written when the document leaves the window (another file opened in
 //! it, the window closed or WordCraft quit). Each window is its own process; they share the file
 //! by reading it fresh before every write, so one window never drops what another remembered.
@@ -23,6 +27,9 @@ use wordcraft_ui_egui::{WordApp, window_geometry::WindowGeometry};
 
 /// How many files are remembered; the ones used longest ago go first.
 const MAX_ENTRIES: usize = 500;
+
+/// The key the Open-Standard is kept under, beside the files (never a real path).
+const STANDARD: &str = "<open-standard>";
 
 /// How long after moving a window its monitor is checked: the move has to arrive first.
 const RESCUE_DELAY: Duration = Duration::from_millis(600);
@@ -72,27 +79,49 @@ pub fn load_from(path: &Path) -> Memory {
 }
 
 /// Adds `entry` for `doc` to what `path` holds and writes it back atomically.
-pub fn store_to(path: &Path, doc: &Path, mut entry: Entry) {
-    let mut memory = load_from(path);
-    entry.at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    memory.insert(key(doc), entry);
-    while memory.len() > MAX_ENTRIES {
-        let Some(oldest) = memory.iter().min_by_key(|(_, e)| e.at).map(|(k, _)| k.clone()) else { break };
-        memory.remove(&oldest);
-    }
-    let Ok(bytes) = serde_json::to_vec_pretty(&memory) else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let tmp = path.with_extension(format!("json.{}", std::process::id()));
-    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+pub fn store_to(path: &Path, doc: &Path, entry: Entry) -> Result<(), String> {
+    store_key(path, key(doc), entry)
 }
 
-/// The window for `doc` as remembered, for opening a new window there directly.
-pub fn launch_geometry(doc: &str) -> Option<WindowGeometry> {
-    load_from(&file()?).get(&key(Path::new(doc))).and_then(|e| e.window.sanitized())
+fn store_key(path: &Path, k: String, mut entry: Entry) -> Result<(), String> {
+    let mut memory = load_from(path);
+    entry.at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    memory.insert(k, entry);
+    while memory.len() > MAX_ENTRIES {
+        let Some(oldest) = memory.iter().filter(|(k, _)| *k != STANDARD).min_by_key(|(_, e)| e.at).map(|(k, _)| k.clone()) else { break };
+        memory.remove(&oldest);
+    }
+    let bytes = serde_json::to_vec_pretty(&memory).map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension(format!("json.{}", std::process::id()));
+    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+/// The Open-Standard in `path`, if one was set.
+#[cfg(test)]
+fn standard_in(path: &Path) -> Option<Entry> {
+    load_from(path).remove(STANDARD)
+}
+
+/// View › Set Open-Standard (the `Services::set_open_default` hook).
+pub fn set_standard(window: Option<WindowGeometry>, zoom: f32, fit: &str) -> Result<(), String> {
+    let store = file().ok_or("preferences are off")?;
+    let window = window.and_then(WindowGeometry::sanitized).ok_or("the window's size isn't known yet")?;
+    store_key(&store, STANDARD.into(), Entry { window, zoom, fit: fit.into(), at: 0 })
+}
+
+/// Where a new window opens: where `doc` was last, else at the Open-Standard. `None`: neither is
+/// known, the window opens as before (the last window used).
+pub fn launch_geometry(doc: Option<&str>) -> Option<WindowGeometry> {
+    let mut memory = load_from(&file()?);
+    let own = doc.and_then(|d| memory.remove(&key(Path::new(d))));
+    own.or_else(|| memory.remove(STANDARD)).and_then(|e| e.window.sanitized())
 }
 
 /// What the window shows now: its file and how it shows it.
@@ -106,6 +135,9 @@ struct Snapshot {
 struct Tracker {
     /// The file shown on the last frame (`None`: no file, or not yet looked at).
     shown: Option<PathBuf>,
+    /// The document shown on the last frame (`None` before the first frame): a new id is a
+    /// document arriving (opened or new), not the same one saved under another name.
+    document: Option<u64>,
     /// The last frame's snapshot, written when the file leaves the window.
     last: Option<Snapshot>,
     /// A window moved to a remembered place, and when: its monitor is checked a little later.
@@ -131,25 +163,28 @@ fn snapshot(app: &WordApp) -> Option<Snapshot> {
 pub fn frame(app: &mut WordApp, ctx: &egui::Context) {
     let Some(store) = file() else { return };
     let shown = shown_file(app);
+    let document = app.session.document_id();
     TRACKER.with(|t| {
         let mut t = t.borrow_mut();
-        if shown != t.shown {
-            if let Some(last) = t.last.take() {
-                store_to(&store, &last.doc, last.entry);
-            }
-            if let Some(doc) = &shown
-                && let Some(entry) = load_from(&store).get(&key(doc)).cloned()
+        let arrived = t.document != Some(document);
+        if shown != t.shown || arrived {
+            // The document leaving (or saved under another name) is remembered under its file.
+            if let Some(last) = t.last.take()
+                && let Err(e) = store_to(&store, &last.doc, last.entry)
             {
-                if let Some(g) = entry.window.sanitized() {
-                    if g.maximized {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-                    } else {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(g.width, g.height)));
-                        if let Some([x, y]) = g.position {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
-                        }
-                    }
-                    t.rescue = Some((g, Instant::now()));
+                log::warn!("window memory: not saved: {e}");
+            }
+        }
+        if arrived {
+            // Its own place if the file has one; otherwise the Open-Standard, if set.
+            let memory = load_from(&store);
+            let own = shown.as_ref().and_then(|doc| memory.get(&key(doc)).cloned());
+            let first_frame = t.document.is_none();
+            let entry = own.clone().or_else(|| memory.get(STANDARD).cloned());
+            if let Some(entry) = entry {
+                // The launch window already opened at the right place (`launch_geometry`).
+                if !first_frame || own.is_none() {
+                    place(ctx, &mut t, &entry);
                 }
                 if let Some(param) = entry.zoom_param()
                     && let Err(e) = app.execute("view.zoom", param)
@@ -157,8 +192,9 @@ pub fn frame(app: &mut WordApp, ctx: &egui::Context) {
                     log::warn!("window memory: zoom not restored: {e}");
                 }
             }
-            t.shown = shown;
+            t.document = Some(document);
         }
+        t.shown = shown;
         // A remembered monitor that isn't there any more: centre the window on the main one.
         if let Some((g, since)) = t.rescue
             && since.elapsed() >= RESCUE_DELAY
@@ -170,17 +206,31 @@ pub fn frame(app: &mut WordApp, ctx: &egui::Context) {
         } else if t.rescue.is_some() {
             ctx.request_repaint_after(RESCUE_DELAY);
         }
-        if let Some(s) = snapshot(app) {
-            t.last = Some(s);
-        }
+        t.last = snapshot(app);
     });
+}
+
+/// Moves and sizes the window to `entry`'s, and checks its monitor a little later.
+fn place(ctx: &egui::Context, t: &mut Tracker, entry: &Entry) {
+    let Some(g) = entry.window.sanitized() else { return };
+    if g.maximized {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+    } else {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(g.width, g.height)));
+        if let Some([x, y]) = g.position {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+        }
+    }
+    t.rescue = Some((g, Instant::now()));
 }
 
 /// When the window closes or WordCraft quits: remember the file shown now.
 pub fn remember_now(app: &WordApp) {
     let Some(store) = file() else { return };
-    if let Some(s) = snapshot(app) {
-        store_to(&store, &s.doc, s.entry);
+    if let Some(s) = snapshot(app)
+        && let Err(e) = store_to(&store, &s.doc, s.entry)
+    {
+        log::warn!("window memory: not saved: {e}");
     }
 }
 
@@ -201,16 +251,31 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wc-window-memory-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = dir.join("window-memory.json");
-        store_to(&store, Path::new("/docs/a.docx"), entry(10.0, 1.25, ""));
+        store_to(&store, Path::new("/docs/a.docx"), entry(10.0, 1.25, "")).unwrap();
         // Another window (process) remembers its file: a.docx stays.
-        store_to(&store, Path::new("/docs/b.docx"), entry(800.0, 1.0, "pageWidth"));
+        store_to(&store, Path::new("/docs/b.docx"), entry(800.0, 1.0, "pageWidth")).unwrap();
         let m = load_from(&store);
         assert_eq!(m["/docs/a.docx"].window.position, Some([10.0, 40.0]));
         assert_eq!(m["/docs/a.docx"].zoom, 1.25);
         assert_eq!(m["/docs/b.docx"].fit, "pageWidth");
         // Reopening a.docx somewhere else replaces its entry.
-        store_to(&store, Path::new("/docs/a.docx"), entry(300.0, 0.8, ""));
+        store_to(&store, Path::new("/docs/a.docx"), entry(300.0, 0.8, "")).unwrap();
         assert_eq!(load_from(&store)["/docs/a.docx"].window.position, Some([300.0, 40.0]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_open_standard_sits_beside_the_files_and_is_never_dropped() {
+        let dir = std::env::temp_dir().join(format!("wc-window-memory-std-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("window-memory.json");
+        store_key(&store, STANDARD.into(), entry(50.0, 1.1, "")).unwrap();
+        for i in 0..MAX_ENTRIES + 5 {
+            store_to(&store, Path::new(&format!("/docs/{i}.docx")), entry(0.0, 1.0, "")).unwrap();
+        }
+        let m = load_from(&store);
+        assert_eq!(m.len(), MAX_ENTRIES);
+        assert_eq!(standard_in(&store).map(|e| e.zoom), Some(1.1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

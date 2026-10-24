@@ -338,6 +338,7 @@ View|Zoom|Zoom In|view.zoomIn
 View|Zoom|Zoom Out|view.zoomOut
 View|Dark Mode|Switch Modes|view.darkMode
 View|Window|New Window|view.newWindow
+View|Window|Set Open-Standard|view.setOpenDefault
 View|Window|Arrange All|view.arrangeAll
 View|Window|Split|view.split
 View|Window|View Side by Side|view.sideBySide
