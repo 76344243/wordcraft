@@ -125,6 +125,12 @@ pub fn specs() -> Vec<CommandSpec> {
             sel_result(s)
         })
         .pure(),
+        // Fork patch (window memory): the window and zoom now become what documents open with.
+        CommandSpec::new("view.setOpenDefault", "Set Open-Standard", "View › Window", |s, _| {
+            s.push_ui_request(json!({"setOpenDefault": true}));
+            sel_result(s)
+        })
+        .pure(),
         CommandSpec::new("view.split", "Split", "View › Window", |s, _| {
             s.push_ui_request(json!({"toggle": "split"}));
             sel_result(s)

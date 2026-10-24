@@ -2302,6 +2302,10 @@ fn view(app: &mut WordApp, ui: &mut Ui) {
     });
     group(ui, "Window", None, app, |ui, app| {
         big(ui, app, "newWindow", "New\nWindow", "view.newWindow", json!({}), false);
+        // Fork patch (window memory): only where the desktop app can keep it.
+        if app.services.set_open_default.is_some() {
+            big(ui, app, "openDefault", "Set Open-\nStandard", "view.setOpenDefault", json!({}), false);
+        }
         big(ui, app, "arrangeAll", "Arrange\nAll", "view.arrangeAll", json!({}), false);
         big(ui, app, "split", "Split", "view.split", json!({}), false);
         // The Full Screen button carries its name for assistive technology (and for the

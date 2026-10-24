@@ -262,6 +262,8 @@ fn services(file_dialog: file_dialogs::Hook, ctx: &egui::Context) -> Services {
         clipboard_formats: Some(Box::new(clipboard::formats)),
         // Fork patch: any number of windows.
         new_window: Some(Box::new(new_window::launch)),
+        // Fork patch: View › Set Open-Standard.
+        set_open_default: Some(Box::new(window_memory::set_standard)),
         ..Default::default()
     }
 }
@@ -410,7 +412,11 @@ fn main() -> eframe::Result {
     load_user_fonts();
     let mut restored = saved_window();
     // Fork patch: a document opened before opens where it was last (window_memory.rs).
-    let remembered = (files.len() == 1).then(|| window_memory::launch_geometry(&files[0])).flatten();
+    let remembered = match files.as_slice() {
+        [] => window_memory::launch_geometry(None),
+        [one] => window_memory::launch_geometry(Some(one)),
+        _ => None,
+    };
     if remembered.is_some() {
         restored = remembered;
     }

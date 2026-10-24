@@ -178,6 +178,10 @@ pub struct Services {
     /// Fork patch (multi_window.rs): desktop: start a new WordCraft window (a new process) with
     /// this file, or with a new blank document for `None`. An error means no window started.
     pub new_window: Option<Box<dyn Fn(Option<&str>) -> Result<(), String>>>,
+    /// Fork patch (window memory): desktop: make this window's geometry and this zoom (percent
+    /// as a factor, and fit mode) what documents without their own open with. `None` hides
+    /// View › Set Open-Standard.
+    pub set_open_default: Option<Box<dyn Fn(Option<window_geometry::WindowGeometry>, f32, &str) -> Result<(), String>>>,
     /// Desktop: the app's own user templates folder (`Templates` in the settings folder, #2852),
     /// used while File › Options names none. File › New lists personal templates from it and Save
     /// as Word Template starts in it. `None` (web) hides personal templates.
@@ -1517,6 +1521,30 @@ impl WordApp {
                 "pasteSpecial" => self.dialog = Some(dialogs::Dialog::paste_special(self, req)),
                 other => self.dialog = dialogs::Dialog::open(other, self),
             }
+        }
+        // Fork patch (window memory): View › Set Open-Standard.
+        if req.get("setOpenDefault").is_some()
+            && let Some(set) = self.services.set_open_default.as_ref()
+        {
+            let msg = match set(self.ui.window, self.session.view.zoom, &self.session.view.fit) {
+                Ok(()) => {
+                    let zoom = if self.session.view.fit.is_empty() {
+                        format!("{:.0} %", self.session.view.zoom * 100.0)
+                    } else {
+                        tl!(match self.session.view.fit.as_str() {
+                            "pageWidth" => "Page Width",
+                            "onePage" => "One Page",
+                            "multiplePages" => "Multiple Pages",
+                            _ => "Text Width",
+                        })
+                        .to_string()
+                    };
+                    let size = self.ui.window.map(|w| format!("{:.0} × {:.0}, ", w.width, w.height)).unwrap_or_default();
+                    format!("Open-Standard: {size}{zoom}")
+                }
+                Err(e) => format!("Open-Standard: {e}"),
+            };
+            self.status(msg);
         }
         if req.get("close").is_some() {
             self.quit_requested = true;
