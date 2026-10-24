@@ -9,7 +9,6 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-// Fork patch: any number of windows.
 mod animations;
 #[cfg(target_os = "macos")]
 mod apple_events;
@@ -20,11 +19,12 @@ mod file_dialogs;
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
 mod graphics;
 mod logging;
-mod new_window;
+mod new_window; // Fork patch: any number of windows.
 mod print;
 mod region;
 #[cfg(target_os = "macos")]
 mod traffic_lights;
+mod window_memory; // Fork patch: every document reopens where it was.
 
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{
@@ -58,6 +58,8 @@ impl eframe::App for App {
         }
         let prev = self.0.ui.window;
         self.0.ui.window = ctx.input(|i| WindowGeometry::track(prev, i.viewport(), i.viewport_rect().size()));
+        // Fork patch: remember and restore each document's window and zoom.
+        window_memory::frame(&mut self.0, ctx);
         // The first frame, once the monitor is known (as `take_rescue` waits for): maximize a
         // window that opened at its normal size so it never flashed on screen half-opened.
         let maximize = self.1.and_then(|g| g.maximize_after_open()).filter(|_| ctx.input(|i| i.viewport().monitor_size.is_some()));
@@ -207,6 +209,8 @@ fn save_prefs(app: &WordApp) {
     if !prefs_enabled() {
         return;
     }
+    // Fork patch: the window and zoom of the document shown.
+    window_memory::remember_now(app);
     if let Some(p) = prefs_path() {
         if let Some(dir) = p.parent()
             && let Err(e) = std::fs::create_dir_all(dir)
@@ -405,8 +409,14 @@ fn main() -> eframe::Result {
     graphics::configure_indirect_validation(&mut options, graphics::skips_indirect_validation(true, cfg!(target_arch = "x86_64")));
     load_user_fonts();
     let mut restored = saved_window();
+    // Fork patch: a document opened before opens where it was last (window_memory.rs).
+    let remembered = (files.len() == 1).then(|| window_memory::launch_geometry(&files[0])).flatten();
+    if remembered.is_some() {
+        restored = remembered;
+    }
     // Fork patch: a window started from another one opens offset from it.
-    if cascade
+    if remembered.is_none()
+        && cascade
         && let Some(w) = restored.as_mut()
         && let Some([x, y]) = w.position
     {

@@ -22,6 +22,8 @@ wordcraft-control-key = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "links"] }
 egui = { workspace = true }
 serde_json = { workspace = true }
+# Fork patch (window_memory.rs).
+serde = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }
 

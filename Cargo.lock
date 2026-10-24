@@ -6540,6 +6540,7 @@ dependencies = [
  "open",
  "pollster 0.4.0",
  "rfd",
+ "serde",
  "serde_json",
  "windows",
  "winit",
