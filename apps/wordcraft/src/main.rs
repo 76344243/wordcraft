@@ -508,7 +508,10 @@ fn main() -> eframe::Result {
             Ok(Box::new(App(
                 app,
                 // With nothing restored, the window the system placed is checked all the same.
-                Some(restored.unwrap_or_default()),
+                // Fork patch: a window placed from window memory keeps its size; WordCraft's
+                // shrink-to-fit (fit_on_monitor) took a near-full-height standard down to the
+                // monitor minus two system bars. window_memory checks its monitor instead.
+                if remembered.is_some() { None } else { Some(restored.unwrap_or_default()) },
                 key_file,
                 dialogs,
                 #[cfg(target_os = "macos")]
