@@ -78,6 +78,8 @@ pub mod updates_ui;
 pub mod widgets;
 pub mod window_close;
 pub mod window_geometry;
+// Fork patch: every document opens where it was (window_memory.rs).
+pub mod window_memory;
 mod window_ui;
 mod windows;
 pub mod wordart_menus;

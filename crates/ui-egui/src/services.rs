@@ -92,6 +92,10 @@ pub struct Services {
     /// used while File › Options names none. File › New lists personal templates from it and Save
     /// as Word Template starts in it. `None` (web) hides personal templates.
     pub templates_dir: Option<std::path::PathBuf>,
+    /// Fork patch (window_memory.rs): desktop: the file where each document's window and zoom and
+    /// the Open-Standard are kept. `None` turns window memory off and hides View › Set
+    /// Open-Standard.
+    pub window_memory: Option<std::path::PathBuf>,
 }
 
 /// Files delivered asynchronously.

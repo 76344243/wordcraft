@@ -58,6 +58,11 @@ impl eframe::App for App {
         // A window that doesn't fit on its screen (the default size on a laptop) shrinks to fit
         // there, so all of the scroll bar can be dragged (#1215). Checked on the frame that first
         // knows the monitor: the off-screen check below takes the pending geometry then.
+        // Fork patch: a window placed from window memory keeps its size; the shrink-to-fit took a
+        // near-full-height Open-Standard down to the monitor minus two system bars.
+        if wordcraft_ui_egui::window_memory::placed_any() {
+            self.1 = None;
+        }
         if let Some((pos, size)) = self.1.and_then(|g| g.fit_on_monitor(&window)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
@@ -229,6 +234,8 @@ fn save_prefs(app: &WordApp) {
     if !prefs_enabled() {
         return;
     }
+    // Fork patch: every window remembers its document's window and zoom.
+    app.window_memory_quit();
     if let Some(p) = prefs_path() {
         if let Some(dir) = p.parent()
             && let Err(e) = std::fs::create_dir_all(dir)
@@ -278,6 +285,8 @@ fn services(file_dialog: file_dialogs::Hook, ctx: &egui::Context) -> Services {
         set_clipboard_html: Some(Box::new(clipboard::set_html)),
         clipboard_rtf: Some(Box::new(clipboard::rtf)),
         clipboard_formats: Some(Box::new(clipboard::formats)),
+        // Fork patch: each document's window and zoom, and the Open-Standard.
+        window_memory: wordcraft_control_key::settings_dir().filter(|_| prefs_enabled()).map(|d| d.join("window-memory.json")),
         ..Default::default()
     }
 }

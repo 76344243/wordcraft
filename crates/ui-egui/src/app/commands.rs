@@ -422,6 +422,10 @@ impl WordApp {
             }
             return;
         }
+        // Fork patch: View › Set Open-Standard (window_memory.rs).
+        if req.get("setOpenDefault").is_some() {
+            self.set_open_standard();
+        }
         // Ctrl+F: type straight into the Navigation pane's search box (#712).
         if req.get("focus").and_then(Value::as_str) == Some("navSearch") {
             self.nav_search_focus = true;

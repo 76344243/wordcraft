@@ -133,6 +133,11 @@ impl Windows {
     }
 
     /// The key of the window whose state is in [`WordApp`]'s fields.
+    /// Fork patch (window_memory.rs): the keys of the open windows.
+    pub(crate) fn keys(&self) -> Vec<u64> {
+        self.open.iter().map(|w| w.key).collect()
+    }
+
     pub(crate) fn shown(&self) -> u64 {
         self.shown
     }
@@ -620,6 +625,8 @@ impl WordApp {
     fn after_windows(&mut self) {
         self.prune_windows();
         self.settle_windows();
+        // Fork patch: windows that closed remember their documents (window_memory.rs).
+        self.window_memory_closed();
         if let Some(&active) = self.windows.recent_keys().first() {
             self.enter_window(active);
         }
@@ -660,6 +667,8 @@ impl WordApp {
         if self.windows.shown != key {
             return;
         }
+        // Fork patch: the window and zoom its document had, or the Open-Standard.
+        self.window_memory_frame(&ctx, key);
         let title = self.sent_title.clone();
         if let Some(w) = self.windows.get_mut(key) {
             w.title = title;
