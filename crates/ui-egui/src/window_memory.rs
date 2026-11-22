@@ -23,8 +23,133 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use craft::ui::runtime::windows::{WindowAction, WindowHost};
+use egui::ViewportId;
+
 use crate::WordApp;
-use crate::window_geometry::{RawWindowState, WindowGeometry};
+use crate::window_geometry::MIN_SIZE;
+
+/// Larger sizes are corrupt.
+const MAX_SIZE: egui::Vec2 = egui::vec2(16384.0, 16384.0);
+/// Positions farther from the origin than this are corrupt.
+const MAX_COORD: f32 = 32768.0;
+
+/// One window's state as its viewport reports it this frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RawWindowState {
+    pub inner_rect: Option<egui::Rect>,
+    pub outer_rect: Option<egui::Rect>,
+    pub monitor_size: Option<egui::Vec2>,
+    pub maximized: Option<bool>,
+    pub minimized: Option<bool>,
+    pub fullscreen: Option<bool>,
+    /// Whether the window lies on a listed monitor; `None` where the host lists none (Wayland).
+    pub on_a_monitor: Option<bool>,
+    /// The primary monitor's bounds in points, when the host lists it.
+    pub primary_monitor_rect: Option<egui::Rect>,
+}
+
+impl RawWindowState {
+    /// The state of `viewport`, from what egui and the window host know about it.
+    fn of(ctx: &egui::Context, viewport: ViewportId) -> Self {
+        let info = ctx.input(|i| i.raw.viewports.get(&viewport).cloned());
+        let v = info.as_ref();
+        let host = WindowHost::of(ctx);
+        let monitors = host.monitors();
+        let to_rect = |m: &craft::behavior::Monitor| {
+            let scale = if m.scale.is_finite() && m.scale > 0.0 { m.scale } else { 1.0 };
+            egui::Rect::from_min_size(
+                egui::pos2(m.pos_px[0] as f32 / scale, m.pos_px[1] as f32 / scale),
+                egui::vec2(m.size_px[0] as f32 / scale, m.size_px[1] as f32 / scale),
+            )
+        };
+        let primary_monitor_rect = monitors.iter().find(|m| m.pos_px == [0, 0]).map(to_rect);
+        let on_a_monitor = (!monitors.is_empty() && host.positions_reported()).then(|| host.monitor_of(viewport).is_some());
+        Self {
+            inner_rect: v.and_then(|v| v.inner_rect).filter(|r| r.is_finite()),
+            outer_rect: v.and_then(|v| v.outer_rect).filter(|r| r.is_finite()),
+            monitor_size: v.and_then(|v| v.monitor_size),
+            maximized: v.and_then(|v| v.maximized),
+            minimized: v.and_then(|v| v.minimized),
+            fullscreen: v.and_then(|v| v.fullscreen),
+            on_a_monitor,
+            primary_monitor_rect,
+        }
+    }
+
+    /// The content size reported by this frame, if any.
+    fn content_size(self) -> Option<egui::Vec2> {
+        self.inner_rect.map(|r| r.size()).filter(|s| s.is_finite() && s.x > 0.0 && s.y > 0.0)
+    }
+}
+
+/// Where a window was and how big (the format WordCraft's own window restore used before the
+/// craft port, so existing `window-memory.json` files stay readable).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WindowGeometry {
+    /// Top-left corner: of the frame, or of the content on macOS. `None` where the platform
+    /// doesn't report it (Wayland).
+    pub position: Option<[f32; 2]>,
+    /// Content size of the un-maximized window.
+    pub width: f32,
+    pub height: f32,
+    pub maximized: bool,
+    /// Size of the monitor the window was on, to notice when that monitor is gone.
+    pub monitor: Option<[f32; 2]>,
+}
+
+impl WindowGeometry {
+    /// The geometry to keep, given the last one and the window as it is now. While the window is
+    /// minimized, full screen or maximized, the last un-maximized size and position are kept.
+    fn track(prev: Option<Self>, window: &RawWindowState) -> Option<Self> {
+        if window.minimized == Some(true) || window.fullscreen == Some(true) {
+            return prev;
+        }
+        // egui reads the maximized state on macOS only when the window opens (egui#3494): there
+        // the zoomed frame is kept like any other size.
+        let maximized = window.maximized == Some(true) && !cfg!(target_os = "macos");
+        if maximized && let Some(prev) = prev {
+            return Some(Self { maximized, ..prev });
+        }
+        let rect = if cfg!(target_os = "macos") { window.inner_rect } else { window.outer_rect };
+        let Some(size) = window.content_size() else {
+            return prev;
+        };
+        let position = rect.map(|r| [r.min.x, r.min.y]);
+        let monitor = window.monitor_size.map(|s| [s.x, s.y]);
+        Self { position, width: size.x, height: size.y, maximized, monitor }.sanitized().or(prev)
+    }
+
+    /// `None` for a size that isn't positive and finite. Otherwise the size is clamped to
+    /// [`MIN_SIZE`]..=16384, and a position or monitor size that can't be real is dropped.
+    fn sanitized(self) -> Option<Self> {
+        let size = egui::vec2(self.width, self.height);
+        if !size.is_finite() || size.x <= 0.0 || size.y <= 0.0 {
+            return None;
+        }
+        let size = size.clamp(MIN_SIZE, MAX_SIZE);
+        let position = self.position.filter(|p| p.iter().all(|c| c.is_finite() && c.abs() <= MAX_COORD));
+        let monitor = self.monitor.filter(|m| m.iter().all(|c| c.is_finite() && *c > 0.0 && *c <= MAX_SIZE.x));
+        Some(Self { position, width: size.x, height: size.y, maximized: self.maximized, monitor })
+    }
+
+    /// Where to move a placed window that ended up on no monitor, or on another monitor than the
+    /// one it was remembered on: centred on the primary monitor. A maximized window stays put.
+    fn rescue_position(&self, window: &RawWindowState) -> Option<egui::Pos2> {
+        if self.maximized || self.position.is_none() {
+            return None;
+        }
+        let now = window.monitor_size.filter(|s| s.is_finite() && s.x > 0.0 && s.y > 0.0)?;
+        let other_monitor = self.monitor.is_some_and(|saved| (now - egui::Vec2::from(saved)).length() > 1.0);
+        if !other_monitor && window.on_a_monitor != Some(false) {
+            return None;
+        }
+        let monitor = window.primary_monitor_rect.unwrap_or_else(|| egui::Rect::from_min_size(egui::Pos2::ZERO, now));
+        let free = monitor.size() - egui::vec2(self.width, self.height);
+        Some(monitor.min + (free / 2.0).max(egui::Vec2::ZERO))
+    }
+}
 
 /// How many files are remembered; the ones used longest ago go first.
 const MAX_ENTRIES: usize = 500;
@@ -138,20 +263,10 @@ struct Tracker {
 #[derive(Default)]
 struct State {
     windows: HashMap<u64, Tracker>,
-    /// A window was placed from window memory: the host's start-up shrink-to-fit
-    /// ([`WindowGeometry::fit_on_monitor`]) must leave it alone ([`placed_any`]).
-    placed: bool,
 }
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
-}
-
-/// Whether a window was placed from window memory. The desktop host then skips its start-up
-/// shrink-to-fit, which took a near-full-height window down to the monitor minus two system bars
-/// and centred it.
-pub fn placed_any() -> bool {
-    STATE.with(|s| s.borrow().placed)
 }
 
 /// Writes the snapshot of the document leaving window `t`, if the user changed how it was shown.
@@ -166,13 +281,13 @@ fn leave(store: &Path, t: &mut Tracker) {
 
 /// A frame of a window whose document stayed: the delayed monitor check, the snapshot, the
 /// baseline once the window settled.
-fn frame_after(ctx: &egui::Context, t: &mut Tracker, raw: &RawWindowState, shown: Option<PathBuf>, zoom: f32, fit: String) {
+fn frame_after(ctx: &egui::Context, viewport: ViewportId, t: &mut Tracker, raw: &RawWindowState, shown: Option<PathBuf>, zoom: f32, fit: String) {
     if let Some((g, since)) = t.rescue
         && since.elapsed() >= SETTLE
     {
         t.rescue = None;
         if let Some(pos) = g.rescue_position(raw) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            WindowHost::of(ctx).act(viewport, WindowAction::SetOuterPosition(pos));
         }
     } else if t.rescue.is_some() {
         ctx.request_repaint_after(SETTLE);
@@ -189,14 +304,15 @@ fn frame_after(ctx: &egui::Context, t: &mut Tracker, raw: &RawWindowState, shown
 }
 
 /// Moves and sizes the drawn window to `entry`'s, and checks its monitor a little later.
-fn place(ctx: &egui::Context, t: &mut Tracker, entry: &Entry) {
+fn place(ctx: &egui::Context, viewport: ViewportId, t: &mut Tracker, entry: &Entry) {
     let Some(g) = entry.window.sanitized() else { return };
+    let host = WindowHost::of(ctx);
     if g.maximized {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        host.act(viewport, WindowAction::SetMaximized(true));
     } else {
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(g.width, g.height)));
+        host.act(viewport, WindowAction::SetInnerSize(egui::vec2(g.width, g.height)));
         if let Some([x, y]) = g.position {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+            host.act(viewport, WindowAction::SetOuterPosition(egui::pos2(x, y)));
         }
     }
     t.rescue = Some((g, Instant::now()));
@@ -208,7 +324,8 @@ impl WordApp {
     /// the arriving one was (or at the Open-Standard).
     pub(crate) fn window_memory_frame(&mut self, ctx: &egui::Context, key: u64) {
         let Some(store) = self.services.window_memory.clone() else { return };
-        let raw = ctx.input(|i| RawWindowState::from_viewport(Some(i.viewport()), Some(i.viewport_rect())));
+        let viewport = WindowHost::of(ctx).current();
+        let raw = RawWindowState::of(ctx, viewport);
         let document = self.shown_document;
         let shown = self.has_document().then(|| self.session.path.clone()).flatten();
         let second_window = self.other_window_on_document().is_some();
@@ -216,7 +333,6 @@ impl WordApp {
         let mut apply_zoom = None;
         STATE.with(|s| {
             let mut s = s.borrow_mut();
-            let mut placed = false;
             let t = s.windows.entry(key).or_default();
             t.window = WindowGeometry::track(t.window, &raw);
             if t.document != Some(document) {
@@ -227,18 +343,16 @@ impl WordApp {
                 if let Some(entry) = entry {
                     // A second window on a document keeps WordCraft's cascade.
                     if !second_window {
-                        place(ctx, t, &entry);
+                        place(ctx, viewport, t, &entry);
                     }
                     apply_zoom = entry.zoom_param();
                 }
                 t.document = Some(document);
                 t.baseline = None;
                 t.baseline_at = Some(Instant::now() + SETTLE * 2);
-                placed = t.rescue.is_some();
             } else {
-                frame_after(ctx, t, &raw, shown, zoom, fit);
+                frame_after(ctx, viewport, t, &raw, shown, zoom, fit);
             }
-            s.placed |= placed;
         });
         if let Some(param) = apply_zoom
             && let Err(e) = self.execute("view.zoom", param)
@@ -369,6 +483,27 @@ mod tests {
         assert_eq!(entry(0.0, 1.5, "").zoom_param(), Some(json!({"value": 150.0})));
         assert_eq!(entry(0.0, f32::NAN, "").zoom_param(), None);
         assert_eq!(entry(0.0, 9.0, "").zoom_param(), None, "outside 10–500 %");
+    }
+
+    #[test]
+    fn a_window_whose_monitor_is_gone_is_centred_on_the_primary_one() {
+        let g = geometry(3000.0);
+        let laptop = egui::vec2(1512.0, 982.0);
+        let raw = RawWindowState { monitor_size: Some(laptop), on_a_monitor: Some(false), ..Default::default() };
+        let pos = g.rescue_position(&raw).unwrap();
+        assert!(pos.x >= 0.0 && pos.x + g.width <= laptop.x, "on the laptop screen: {pos:?}");
+        let same = RawWindowState { monitor_size: Some(egui::vec2(2560.0, 1440.0)), on_a_monitor: Some(true), ..Default::default() };
+        assert_eq!(g.rescue_position(&same), None, "still on its monitor");
+    }
+
+    #[test]
+    fn insane_geometry_is_dropped_or_clamped() {
+        let mut g = geometry(f32::NAN);
+        assert_eq!(g.sanitized().unwrap().position, None);
+        g.width = f32::INFINITY;
+        assert_eq!(g.sanitized(), None);
+        let tiny = WindowGeometry { width: 10.0, height: 10.0, ..geometry(0.0) }.sanitized().unwrap();
+        assert!(tiny.width >= MIN_SIZE.x && tiny.height >= MIN_SIZE.y);
     }
 
     #[test]
